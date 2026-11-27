@@ -1,0 +1,36 @@
+{
+    "actorSpecification": 1,
+    "fields": {},
+    "views": {
+        "overview": {
+            "title": "Sold & Market Listings",
+            "transformation": {
+                "fields": [
+                    "title",
+                    "totalPrice",
+                    "price",
+                    "shippingCost",
+                    "currency",
+                    "soldDate",
+                    "condition",
+                    "country",
+                    "url"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "title": { "label": "Title", "format": "text" },
+                    "totalPrice": { "label": "Total Price", "format": "number" },
+                    "price": { "label": "Item Price", "format": "number" },
+                    "shippingCost": { "label": "Shipping", "format": "number" },
+                    "currency": { "label": "Currency", "format": "text" },
+                    "soldDate": { "label": "Sold Date", "format": "text" },
+                    "condition": { "label": "Condition", "format": "text" },
+                    "country": { "label": "Market", "format": "text" },
+                    "url": { "label": "Listing URL", "format": "link" }
+                }
+            }
+        }
+    }
+}
