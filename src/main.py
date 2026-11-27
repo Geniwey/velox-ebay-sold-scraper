@@ -7,17 +7,17 @@ from curl_cffi.requests import AsyncSession
 from apify import Actor
 
 DOMAINS = {
-    'US': ('www.ebay.com', 'USD'),
-    'UK': ('www.ebay.co.uk', 'GBP'),
-    'DE': ('www.ebay.de', 'EUR'),
-    'ES': ('www.ebay.es', 'EUR'),
-    'FR': ('www.ebay.fr', 'EUR'),
-    'IT': ('www.ebay.it', 'EUR'),
-    'AU': ('www.ebay.com.au', 'AUD'),
-    'CA': ('www.ebay.ca', 'CAD'),
+    'US': ('www.ebay.com', 'USD', 'en-US,en;q=0.9'),
+    'UK': ('www.ebay.co.uk', 'GBP', 'en-GB,en;q=0.9'),
+    'DE': ('www.ebay.de', 'EUR', 'de-DE,de;q=0.9,en;q=0.8'),
+    'ES': ('www.ebay.es', 'EUR', 'es-ES,es;q=0.9,en;q=0.8'),
+    'FR': ('www.ebay.fr', 'EUR', 'fr-FR,fr;q=0.9,en;q=0.8'),
+    'IT': ('www.ebay.it', 'EUR', 'it-IT,it;q=0.9,en;q=0.8'),
+    'AU': ('www.ebay.com.au', 'AUD', 'en-AU,en;q=0.9'),
+    'CA': ('www.ebay.ca', 'CAD', 'en-CA,en;q=0.9'),
 }
 
-IMPERSONATIONS = ['chrome124', 'chrome120', 'safari17_0', 'edge101']
+IMPERSONATIONS = ['chrome131', 'chrome124', 'safari18_0', 'safari17_0']
 
 
 def parse_money(raw_text: str) -> float | None:
@@ -51,32 +51,60 @@ def extract_item_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-async def fetch_with_retry(search_url: str, proxy_config, domain: str, max_retries: int = 4) -> str | None:
-    for attempt in range(1, max_retries + 1):
-        impersonate = random.choice(IMPERSONATIONS)
-        proxy_url = await proxy_config.new_url() if proxy_config else None
-        proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+async def build_warm_session(domain: str, accept_lang: str, proxy_url: str | None) -> AsyncSession:
+    impersonate = random.choice(IMPERSONATIONS)
+    proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+    session = AsyncSession(impersonate=impersonate, proxies=proxies, timeout=30)
 
+    base_headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': accept_lang,
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+    }
+    # Warm up homepage to obtain real eBay session cookies (_s, dp1, nonsession)
+    await session.get(f'https://{domain}/', headers=base_headers)
+    await asyncio.sleep(random.uniform(0.8, 1.6))
+    return session
+
+
+async def fetch_with_retry(search_url: str, proxy_config, domain: str, accept_lang: str, max_retries: int = 4) -> str | None:
+    for attempt in range(1, max_retries + 1):
+        # Try direct/standard proxy first, then rotate proxy on subsequent attempts
+        use_proxy = proxy_config is not None and attempt > 1
+        proxy_url = await proxy_config.new_url() if use_proxy else None
+        session = None
         try:
-            async with AsyncSession(impersonate=impersonate) as session:
-                response = await session.get(
-                    search_url,
-                    proxies=proxies,
-                    timeout=30,
-                    headers={
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9',
-                        'Referer': f'https://{domain}/',
-                        'Upgrade-Insecure-Requests': '1',
-                    },
-                )
-                if response.status_code == 200 and 's-item' in response.text:
-                    return response.text
-                Actor.log.warning(f'Attempt {attempt}/{max_retries}: HTTP {response.status_code} (or challenge page). Rotating proxy...')
+            session = await build_warm_session(domain, accept_lang, proxy_url)
+            response = await session.get(
+                search_url,
+                headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': accept_lang,
+                    'Referer': f'https://{domain}/',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'same-origin',
+                    'Sec-Fetch-User': '?1',
+                },
+            )
+            if response.status_code == 200 and ('s-item' in response.text or 'srp-results' in response.text):
+                await session.close()
+                return response.text
+            Actor.log.warning(
+                f'Attempt {attempt}/{max_retries} (proxy={use_proxy}): HTTP {response.status_code}. Retrying...'
+            )
         except Exception as exc:
             Actor.log.warning(f'Attempt {attempt}/{max_retries} error: {exc}')
+        finally:
+            if session:
+                await session.close()
 
-        await asyncio.sleep(random.uniform(1.0, 2.5))
+        await asyncio.sleep(random.uniform(1.2, 2.5))
     return None
 
 
@@ -89,16 +117,19 @@ async def main() -> None:
             return
 
         country = actor_input.get('country', 'US').upper()
-        domain, default_currency = DOMAINS.get(country, ('www.ebay.com', 'USD'))
+        domain, default_currency, accept_lang = DOMAINS.get(
+            country, ('www.ebay.com', 'USD', 'en-US,en;q=0.9')
+        )
         sold_only = actor_input.get('soldOnly', True)
         condition = actor_input.get('condition', 'ALL')
         max_items = int(actor_input.get('maxItems', 60))
 
-        proxy_input = actor_input.get('proxyConfiguration') or {
-            'useApifyProxy': True,
-            'apifyProxyGroups': ['RESIDENTIAL'],
-        }
-        proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+        proxy_config = None
+        try:
+            proxy_input = actor_input.get('proxyConfiguration') or {'useApifyProxy': True}
+            proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+        except Exception as exc:
+            Actor.log.warning(f'Proxy configuration unavailable ({exc}), falling back to direct connection.')
 
         collected = 0
         page = 1
@@ -121,7 +152,7 @@ async def main() -> None:
             search_url = f'https://{domain}/sch/i.html?{urlencode(params)}'
             Actor.log.info(f'Fetching page {page} on {domain} for "{query}"...')
 
-            html = await fetch_with_retry(search_url, proxy_config, domain)
+            html = await fetch_with_retry(search_url, proxy_config, domain, accept_lang)
             if not html:
                 Actor.log.error(f'Failed to retrieve page {page} after retries. Stopping.')
                 break
@@ -145,13 +176,13 @@ async def main() -> None:
                 if 'srp-river-answer--REWRITE_START' in classes:
                     hit_rewrite_divider = True
                     break
-                if 's-item' not in classes:
+                if 's-item' not in classes and 's-card' not in classes:
                     continue
                 if collected >= max_items:
                     break
 
-                link_el = node.select_one('a.s-item__link')
-                title_el = node.select_one('.s-item__title')
+                link_el = node.select_one('a.s-item__link, a[href*="/itm/"]')
+                title_el = node.select_one('.s-item__title, [role="heading"]')
                 if not link_el or not title_el:
                     continue
 
