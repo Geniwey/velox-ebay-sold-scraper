@@ -1,0 +1,12 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "eBay Sold Listings Output",
+    "description": "Structured eBay market intelligence dataset with total landed prices and sale dates.",
+    "properties": {
+        "results": {
+            "type": "string",
+            "title": "eBay Market Dataset",
+            "template": "{{links.apiDefaultDatasetUrl}}/items"
+        }
+    }
+}
