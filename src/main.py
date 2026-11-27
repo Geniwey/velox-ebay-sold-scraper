@@ -1,3 +1,4 @@
+import asyncio
 import re
 from urllib.parse import urlencode
 from bs4 import BeautifulSoup
@@ -47,6 +48,67 @@ def extract_item_id(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+async def fetch_page_html(playwright, search_url: str, proxy_config, max_attempts: int = 4) -> str | None:
+    for attempt in range(1, max_attempts + 1):
+        proxy_settings = None
+        if proxy_config:
+            try:
+                proxy_info = await proxy_config.new_proxy_info()
+                if proxy_info:
+                    proxy_settings = {
+                        'server': f'{proxy_info.scheme}://{proxy_info.hostname}:{proxy_info.port}',
+                        'username': proxy_info.username,
+                        'password': proxy_info.password,
+                    }
+            except Exception as e:
+                Actor.log.warning(f'Proxy error: {e}')
+
+        browser = await playwright.chromium.launch(
+            headless=True,
+            proxy=proxy_settings,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+            ],
+        )
+        try:
+            context = await browser.new_context(
+                viewport={'width': 1366, 'height': 768},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                locale='en-US',
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            await context.route(
+                '**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4}',
+                lambda route: route.abort(),
+            )
+
+            page = await context.new_page()
+            await page.goto(search_url, wait_until='domcontentloaded', timeout=45000)
+            await asyncio.sleep(2.5)
+
+            title = await page.title()
+            if 'error page' in title.lower() or 'pardon our interruption' in title.lower():
+                Actor.log.warning(f'Attempt {attempt}/{max_attempts} blocked ({title}). Rotating IP...')
+                continue
+
+            await page.wait_for_selector('li.s-item, li.s-card, ul.srp-results', timeout=15000)
+            html = await page.content()
+            if 's-item' in html or 's-card' in html:
+                return html
+
+            Actor.log.warning(f'Attempt {attempt}/{max_attempts}: No items in HTML ({title}). Retrying...')
+        except Exception as exc:
+            Actor.log.warning(f'Attempt {attempt}/{max_attempts} failed: {exc}')
+        finally:
+            await browser.close()
+
+    return None
+
+
 async def main() -> None:
     async with Actor:
         actor_input = await Actor.get_input() or {}
@@ -61,36 +123,18 @@ async def main() -> None:
         condition = actor_input.get('condition', 'ALL')
         max_items = int(actor_input.get('maxItems', 60))
 
+        proxy_config = None
+        try:
+            proxy_input = actor_input.get('proxyConfiguration') or {'useApifyProxy': True}
+            proxy_config = await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+        except Exception as exc:
+            Actor.log.warning(f'Could not init proxy config: {exc}')
+
         collected = 0
         page_num = 1
         seen_ids = set()
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                ],
-            )
-            context = await browser.new_context(
-                viewport={'width': 1366, 'height': 768},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                locale='en-US',
-            )
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
-
-            # Block heavy media/fonts to load pages in <2 seconds
-            await context.route(
-                '**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,mp4}',
-                lambda route: route.abort(),
-            )
-
-            page = await context.new_page()
-
             while collected < max_items:
                 params = {
                     '_nkw': query,
@@ -106,19 +150,16 @@ async def main() -> None:
                     params['LH_ItemCondition'] = condition
 
                 search_url = f'https://{domain}/sch/i.html?{urlencode(params)}'
-                Actor.log.info(f'Opening page {page_num} on {domain} for "{query}"...')
+                Actor.log.info(f'Fetching page {page_num} on {domain} for "{query}"...')
 
-                await page.goto(search_url, wait_until='domcontentloaded', timeout=45000)
-                try:
-                    await page.wait_for_selector('li.s-item, li.s-card', timeout=15000)
-                except Exception:
-                    Actor.log.warning(f'Timed out waiting for listings on page {page_num}. Title: {await page.title()}')
+                html = await fetch_page_html(p, search_url, proxy_config)
+                if not html:
+                    Actor.log.error(f'Blocked on all proxy attempts for page {page_num}.')
                     break
 
-                html = await page.content()
                 soup = BeautifulSoup(html, 'lxml')
                 results_container = soup.select_one('ul.srp-results')
-                nodes = results_container.find_all('li', recursive=False) if results_container else soup.select('li.s-item')
+                nodes = results_container.find_all('li', recursive=False) if results_container else soup.select('li.s-item, li.s-card')
 
                 if not nodes:
                     break
@@ -136,8 +177,8 @@ async def main() -> None:
                     if collected >= max_items:
                         break
 
-                    link_el = node.select_one('a.s-item__link, a[href*="/itm/"]')
-                    title_el = node.select_one('.s-item__title, [role="heading"]')
+                    link_el = node.select_one('a.s-item__link, a.s-card__link, a[href*="/itm/"]')
+                    title_el = node.select_one('.s-item__title, .s-card__title, [role="heading"]')
                     if not link_el or not title_el:
                         continue
 
@@ -152,21 +193,21 @@ async def main() -> None:
                     if not title or title.lower().startswith('shop on ebay'):
                         continue
 
-                    price_el = node.select_one('.s-item__price')
+                    price_el = node.select_one('.s-item__price, .s-card__price')
                     raw_price = price_el.get_text(' ', strip=True) if price_el else ''
                     price = parse_money(raw_price)
                     if price is None:
                         continue
 
-                    ship_el = node.select_one('.s-item__shipping, .s-item__logisticsCost')
+                    ship_el = node.select_one('.s-item__shipping, .s-item__logisticsCost, .s-card__shipping')
                     raw_ship = ship_el.get_text(' ', strip=True) if ship_el else ''
                     shipping_cost = parse_money(raw_ship) or 0.0
                     total_price = round(price + shipping_cost, 2)
 
-                    sold_el = node.select_one('.s-item__title--tag .POSITIVE, .s-item__caption--signal .POSITIVE')
+                    sold_el = node.select_one('.s-item__title--tag .POSITIVE, .s-item__caption--signal .POSITIVE, .POSITIVE')
                     sold_date = sold_el.get_text(' ', strip=True) if sold_el else None
 
-                    cond_el = node.select_one('.SECONDARY_INFO')
+                    cond_el = node.select_one('.SECONDARY_INFO, .s-card__subtitle')
                     item_condition = cond_el.get_text(' ', strip=True) if cond_el else None
 
                     seller_el = node.select_one('.s-item__seller-info-text')
@@ -175,7 +216,7 @@ async def main() -> None:
                     loc_el = node.select_one('.s-item__location')
                     location = loc_el.get_text(' ', strip=True) if loc_el else None
 
-                    img_el = node.select_one('.s-item__image-wrapper img')
+                    img_el = node.select_one('img')
                     image_url = (img_el.get('src') or img_el.get('data-src')) if img_el else None
 
                     seen_ids.add(item_id)
@@ -209,7 +250,5 @@ async def main() -> None:
                     break
 
                 page_num += 1
-
-            await browser.close()
 
         Actor.log.info(f'Finished. Extracted {collected} listings.')
